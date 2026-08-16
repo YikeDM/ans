@@ -1,3 +1,3 @@
 [hosts]
-ansible2@10.10.10.34
-ansible3@10.10.10.106
+ansible2@10.10.10.34 ansible_become_password=ansible2
+ansible3@10.10.10.106 ansible_become_password=ansible3
