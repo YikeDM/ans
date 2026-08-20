@@ -1,0 +1,418 @@
+---
+- name: CIS filesystem layout
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    vg_name: ubuntu-vg
+
+    filesystem_lvs:
+      - lv: var
+        size: 3G
+        mountpoint: /var
+        temp_mount: /mnt/cis-var
+        options: defaults,nosuid,nodev
+
+      - lv: var-log
+        size: 2G
+        mountpoint: /var/log
+        temp_mount: /mnt/cis-var-log
+        options: defaults,nosuid,nodev,noexec
+
+      - lv: var-tmp
+        size: 2G
+        mountpoint: /var/tmp
+        temp_mount: /mnt/cis-var-tmp
+        options: defaults,nosuid,nodev,noexec
+
+      - lv: home
+        size: 1G
+        mountpoint: /home
+        temp_mount: /mnt/cis-home
+        options: defaults,nosuid,nodev,noexec
+
+  pre_tasks:
+
+    - name: Check whether target mountpoints are already separate filesystems
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - "{{ item.mountpoint }}"
+      register: existing_mounts
+      changed_when: false
+      failed_when: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Refuse to run if a target is already mounted separately
+      ansible.builtin.assert:
+        that:
+          - item.rc != 0
+        fail_msg: >-
+          {{ item.item.mountpoint }} is already a mountpoint.
+          This playbook is intended for the initial migration.
+      loop: "{{ existing_mounts.results }}"
+
+    - name: Check required VG exists
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - "{{ vg_name }}"
+      changed_when: false
+
+    - name: Check available VG space
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --noheadings
+          - --units
+          - g
+          - --nosuffix
+          - -o
+          - vg_free
+          - "{{ vg_name }}"
+      register: vg_free
+      changed_when: false
+
+    - name: Display available VG space
+      ansible.builtin.debug:
+        msg: "Free space in {{ vg_name }}: {{ vg_free.stdout | trim }} GiB"
+
+    - name: Install rsync
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+        update_cache: true
+
+  tasks:
+
+    - name: Create logical volumes
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ item.lv }}"
+        size: "{{ item.size }}"
+        state: present
+        shrink: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Create ext4 filesystems
+      community.general.filesystem:
+        dev: "/dev/{{ vg_name }}/{{ item.lv }}"
+        fstype: ext4
+        state: present
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Create temporary migration mountpoints
+      ansible.builtin.file:
+        path: "{{ item.temp_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Temporarily mount new filesystems
+      ansible.posix.mount:
+        path: "{{ item.temp_mount }}"
+        src: "/dev/{{ vg_name }}/{{ item.lv }}"
+        fstype: ext4
+        opts: defaults
+        state: ephemeral
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Create /var/log inside new /var filesystem
+      ansible.builtin.file:
+        path: /mnt/cis-var/log
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create /var/tmp inside new /var filesystem
+      ansible.builtin.file:
+        path: /mnt/cis-var/tmp
+        state: directory
+        owner: root
+        group: root
+        mode: "1777"
+
+    - name: Copy /var excluding /var/log and /var/tmp
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAXS
+          - --numeric-ids
+          - --exclude=/log/***
+          - --exclude=/tmp/***
+          - /var/
+          - /mnt/cis-var/
+      changed_when: true
+
+    - name: Copy /var/log
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAXS
+          - --numeric-ids
+          - /var/log/
+          - /mnt/cis-var-log/
+      changed_when: true
+
+    - name: Copy /var/tmp
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAXS
+          - --numeric-ids
+          - /var/tmp/
+          - /mnt/cis-var-tmp/
+      changed_when: true
+
+    - name: Copy /home
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAXS
+          - --numeric-ids
+          - /home/
+          - /mnt/cis-home/
+      changed_when: true
+
+    - name: Check migrated filesystem contents
+      ansible.builtin.command:
+        argv:
+          - du
+          - -sh
+          - "{{ item.temp_mount }}"
+      register: migrated_sizes
+      changed_when: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Show migrated filesystem sizes
+      ansible.builtin.debug:
+        msg: "{{ item.item.lv }}: {{ item.stdout }}"
+      loop: "{{ migrated_sizes.results }}"
+
+    - name: Get filesystem UUIDs
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - UUID
+          - -o
+          - value
+          - "/dev/{{ vg_name }}/{{ item.lv }}"
+      register: filesystem_uuids
+      changed_when: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Ensure final mountpoints exist
+      ansible.builtin.file:
+        path: "{{ item.mountpoint }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Configure and mount filesystem LVs
+      ansible.posix.mount:
+        path: "{{ item.item.mountpoint }}"
+        src: "UUID={{ item.stdout | trim }}"
+        fstype: ext4
+        opts: "{{ item.item.options }}"
+        dump: "0"
+        passno: "2"
+        state: mounted
+        backup: true
+      loop: "{{ filesystem_uuids.results }}"
+
+    - name: Configure and mount /tmp as tmpfs
+      ansible.posix.mount:
+        path: /tmp
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,nosuid,nodev,noexec,size=1G
+        dump: "0"
+        passno: "0"
+        state: mounted
+        backup: true
+
+    - name: Configure and mount /dev/shm
+      ansible.posix.mount:
+        path: /dev/shm
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,nosuid,nodev,noexec
+        dump: "0"
+        passno: "0"
+        state: mounted
+        backup: true
+
+    - name: Get /boot source device
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - -o
+          - SOURCE
+          - /boot
+      register: boot_source
+      changed_when: false
+
+    - name: Get /boot filesystem UUID
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - UUID
+          - -o
+          - value
+          - "{{ boot_source.stdout | trim }}"
+      register: boot_uuid
+      changed_when: false
+
+    - name: Configure /boot hardening
+      ansible.posix.mount:
+        path: /boot
+        src: "UUID={{ boot_uuid.stdout | trim }}"
+        fstype: ext4
+        opts: defaults,nosuid,nodev,noexec
+        dump: "0"
+        passno: "2"
+        state: mounted
+        backup: true
+
+    - name: Verify filesystem mounts
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - "{{ item.mountpoint }}"
+      register: live_mounts
+      changed_when: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Verify /tmp
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /tmp
+      register: live_tmp
+      changed_when: false
+
+    - name: Verify /dev/shm
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /dev/shm
+      register: live_shm
+      changed_when: false
+
+    - name: Verify /boot
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /boot
+      register: live_boot
+      changed_when: false
+
+    - name: Remove temporary migration mounts
+      ansible.posix.mount:
+        path: "{{ item.temp_mount }}"
+        state: unmounted
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Remove temporary migration directories
+      ansible.builtin.file:
+        path: "{{ item.temp_mount }}"
+        state: absent
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Test fstab
+      ansible.builtin.command:
+        argv:
+          - mount
+          - -a
+      changed_when: false
+
+    - name: Reboot to verify persistent mounts
+      ansible.builtin.reboot:
+        msg: "Rebooting after CIS filesystem configuration"
+        reboot_timeout: 600
+        post_reboot_delay: 10
+
+    - name: Verify mounts after reboot
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - "{{ item.mountpoint }}"
+      register: post_reboot_mounts
+      changed_when: false
+      loop: "{{ filesystem_lvs }}"
+
+    - name: Verify /tmp after reboot
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /tmp
+      register: post_reboot_tmp
+      changed_when: false
+
+    - name: Verify /dev/shm after reboot
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /dev/shm
+      register: post_reboot_shm
+      changed_when: false
+
+    - name: Verify /boot after reboot
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -n
+          - /boot
+      register: post_reboot_boot
+      changed_when: false
+
+    - name: Check for failed systemd units
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --failed
+          - --no-legend
+      register: failed_units
+      changed_when: false
+
+    - name: Fail if systemd has failed units
+      ansible.builtin.fail:
+        msg: |
+          Systemd has failed units after filesystem migration:
+
+          {{ failed_units.stdout }}
+      when: failed_units.stdout | trim != ""
+
+    - name: Display final mount state
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ post_reboot_mounts.results }}"
+
+    - name: Display /tmp state
+      ansible.builtin.debug:
+        msg: "{{ post_reboot_tmp.stdout }}"
+
+    - name: Display /dev/shm state
+      ansible.builtin.debug:
+        msg: "{{ post_reboot_shm.stdout }}"
+
+    - name: Display /boot state
+      ansible.builtin.debug:
+        msg: "{{ post_reboot_boot.stdout }}"
